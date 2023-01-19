@@ -155,6 +155,8 @@ static inline int migrate_misplaced_page(struct page *page,
 }
 #endif /* CONFIG_NUMA_BALANCING */
 
+extern struct page *alloc_misplaced_dst_page(struct page *page, unsigned long data);
+
 #ifdef CONFIG_MIGRATION
 
 /*

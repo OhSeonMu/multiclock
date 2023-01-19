@@ -1144,6 +1144,8 @@ int __ref online_pages(unsigned long pfn, unsigned long nr_pages,
 	init_per_zone_wmark_min();
 
 	kswapd_run(nid);
+	if (nid==1)
+		kpromoted_run(nid);
 	kcompactd_run(nid);
 
 	writeback_set_ratelimit();
@@ -1942,6 +1944,8 @@ int __ref offline_pages(unsigned long start_pfn, unsigned long nr_pages,
 	if (arg.status_change_nid >= 0) {
 		kswapd_stop(node);
 		kcompactd_stop(node);
+		if (node == 1)
+			kpromoted_stop(node); /* TODO_FOR_PROMOTE : stop kpromoted */
 	}
 
 	writeback_set_ratelimit();

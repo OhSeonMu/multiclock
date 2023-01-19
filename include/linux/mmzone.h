@@ -273,13 +273,16 @@ static __always_inline bool vmstat_item_in_bytes(int idx)
  */
 #define LRU_BASE 0
 #define LRU_ACTIVE 1
-#define LRU_FILE 2
+#define LRU_PROMOTE	2	/* TODO_FOR_PROMOTE : new number for promote list */
+#define LRU_FILE 3		/* TODO_FOR_PROMOTE : change number for promote list */
 
 enum lru_list {
 	LRU_INACTIVE_ANON = LRU_BASE,
 	LRU_ACTIVE_ANON = LRU_BASE + LRU_ACTIVE,
+	LRU_PROMOTE_ANON = LRU_BASE + LRU_PROMOTE,			  /* TODO_FOR_PROMOTE : promote anon*/
 	LRU_INACTIVE_FILE = LRU_BASE + LRU_FILE,
 	LRU_ACTIVE_FILE = LRU_BASE + LRU_FILE + LRU_ACTIVE,
+	LRU_PROMOTE_FILE = LRU_BASE + LRU_FILE + LRU_PROMOTE, /* TODO_FOR_PROMOTE : promote file*/
 	LRU_UNEVICTABLE,
 	NR_LRU_LISTS
 };
@@ -294,16 +297,24 @@ enum vmscan_throttle_state {
 
 #define for_each_lru(lru) for (lru = 0; lru < NR_LRU_LISTS; lru++)
 
-#define for_each_evictable_lru(lru) for (lru = 0; lru <= LRU_ACTIVE_FILE; lru++)
+/* TODO_FOR_PROMOTE : modify for find evictable lru */
+#define for_each_evictable_lru(lru) for (lru = 0; lru <= LRU_PROMOTE_FILE; lru++)
 
+/* TODO_FOR_PROMOTE : modify for find file lru */
 static inline bool is_file_lru(enum lru_list lru)
 {
-	return (lru == LRU_INACTIVE_FILE || lru == LRU_ACTIVE_FILE);
+	return (lru == LRU_INACTIVE_FILE || lru == LRU_ACTIVE_FILE || lru == LRU_PROMOTE_FILE);
 }
 
 static inline bool is_active_lru(enum lru_list lru)
 {
 	return (lru == LRU_ACTIVE_ANON || lru == LRU_ACTIVE_FILE);
+}
+
+/* TODO_FOR_PROMOTE : check whether lru is promote */
+static inline bool is_promote_lru(enum lru_list lru)
+{
+	return (lru == LRU_PROMOTE_ANON || lru == LRU_PROMOTE_FILE);
 }
 
 #define ANON_AND_FILE 2
@@ -959,6 +970,7 @@ typedef struct pglist_data {
 	enum zone_type kswapd_highest_zoneidx;
 
 	int kswapd_failures;		/* Number of 'reclaimed == 0' runs */
+	struct task_struct *kpromoted;	/* TODO_FOR_PROMOTE : kpromoted struck at pg_data_t */
 
 #ifdef CONFIG_COMPACTION
 	int kcompactd_max_order;

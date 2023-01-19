@@ -159,6 +159,9 @@ struct scan_control {
 
 	/* for recording the reclaimed slab by now */
 	struct reclaim_state reclaim_state;
+
+	/* TODO_FOR_PROMOTE : at shrink_promote_list, go to active list */
+	unsigned int no_shrink:1;
 };
 
 #ifdef ARCH_HAS_PREFETCHW
@@ -2556,7 +2559,114 @@ static void shrink_active_list(unsigned long nr_to_scan,
 				folio_unlock(folio);
 			}
 		}
+		/* Referenced or rmap lock contention: rotate */
+		if (folio_referenced(folio, 0, sc->target_mem_cgroup,
+				     &vm_flags) != 0) {
+			/*
+			 * Identify referenced, file-backed active folios and
+			 * give them one more trip around the active list. So
+			 * that executable code get better chances to stay in
+			 * memory under moderate memory pressure.  Anon folios
+			 * are not likely to be evicted by use-once streaming
+			 * IO, plus JVM can create lots of anon VM_EXEC folios,
+			 * so we ignore them here.
+			 */
+			/* TODO_FOR_PROMOTE : shrink_active_list at hight tier */
+			if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio) && pgdat->node_id == 0) {
+				nr_rotated += folio_nr_pages(folio);
+				list_add(&folio->lru, &l_active);
+				continue;
+			}
+			/* TODO_FOR_PROMOTE : shrink_active_list at low tier */
+			if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio) && pgdat->node_id == 1) {
+				nr_rotated += folio_nr_pages(folio);
+				folio_clear_active(folio);	/* we are de-activating */
+				folio_set_promote(folio);
+				list_add(&folio->lru, &l_active);
+				continue;
+			}
+		}
+		
+		folio_clear_active(folio);	/* we are de-activating */
+		folio_set_workingset(folio);
+		list_add(&folio->lru, &l_inactive);
+	}
 
+	/*
+	 * Move folios back to the lru list.
+	 */
+	spin_lock_irq(&lruvec->lru_lock);
+
+	nr_activate = move_pages_to_lru(lruvec, &l_active);
+	nr_deactivate = move_pages_to_lru(lruvec, &l_inactive);
+	/* Keep all free folios in l_active list */
+	list_splice(&l_inactive, &l_active);
+
+	__count_vm_events(PGDEACTIVATE, nr_deactivate);
+	__count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE, nr_deactivate);
+
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+	spin_unlock_irq(&lruvec->lru_lock);
+
+	mem_cgroup_uncharge_list(&l_active);
+	free_unref_page_list(&l_active);
+	trace_mm_vmscan_lru_shrink_active(pgdat->node_id, nr_taken, nr_activate,
+			nr_deactivate, nr_rotated, sc->priority, file);
+}
+
+/* TODO_FOR_PROMOTE : shrink_promote_list */
+static void shrink_promote_list(unsigned long nr_to_scan,
+			       struct lruvec *lruvec,
+			       struct scan_control *sc,
+			       enum lru_list lru)
+{
+	unsigned long nr_taken;
+	unsigned long nr_scanned;
+	unsigned long vm_flags;
+	/* TODO_FOR_PROMOTE : fot migrate at shrink_promote_list */
+	unsigned int nr_succeeded;
+	LIST_HEAD(l_hold);	/* The folios which were snipped off */
+	LIST_HEAD(l_active);
+	LIST_HEAD(l_inactive);
+	unsigned nr_deactivate, nr_activate;
+	unsigned nr_rotated = 0;
+	int file = is_file_lru(lru);
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+
+	lru_add_drain();
+
+	spin_lock_irq(&lruvec->lru_lock);
+
+	nr_taken = isolate_lru_pages(nr_to_scan, lruvec, &l_hold,
+				     &nr_scanned, sc, lru);
+
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
+
+	if (!cgroup_reclaim(sc))
+		__count_vm_events(PGREFILL, nr_scanned);
+	__count_memcg_events(lruvec_memcg(lruvec), PGREFILL, nr_scanned);
+
+	spin_unlock_irq(&lruvec->lru_lock);
+
+	while (!list_empty(&l_hold)) {
+		struct folio *folio;
+
+		cond_resched();
+		folio = lru_to_folio(&l_hold);
+		list_del(&folio->lru);
+
+		if (unlikely(!folio_evictable(folio))) {
+			folio_putback_lru(folio);
+			continue;
+		}
+
+		if (unlikely(buffer_heads_over_limit)) {
+			if (folio_test_private(folio) && folio_trylock(folio)) {
+				if (folio_test_private(folio))
+					filemap_release_folio(folio, 0);
+				folio_unlock(folio);
+			}
+		}
 		/* Referenced or rmap lock contention: rotate */
 		if (folio_referenced(folio, 0, sc->target_mem_cgroup,
 				     &vm_flags) != 0) {
@@ -2575,9 +2685,12 @@ static void shrink_active_list(unsigned long nr_to_scan,
 				continue;
 			}
 		}
-
-		folio_clear_active(folio);	/* we are de-activating */
-		folio_set_workingset(folio);
+		
+		if(!sc->no_shrink){
+			/* TODO_FOR_PROMOTE : clear promote bit and set active bit */
+			folio_clear_promote(folio);	/* we are de-activating */
+			folio_set_active(folio);
+		}
 		list_add(&folio->lru, &l_inactive);
 	}
 
@@ -2586,7 +2699,17 @@ static void shrink_active_list(unsigned long nr_to_scan,
 	 */
 	spin_lock_irq(&lruvec->lru_lock);
 
-	nr_activate = move_pages_to_lru(lruvec, &l_active);
+	/* TODO_FOR_PROMOTE : promote page */
+	migrate_pages(&l_active, alloc_misplaced_dst_page,
+			NULL, 0, MIGRATE_SYNC, MR_NUMA_MISPLACED, &nr_succeeded);
+
+	/*
+	migrate_pages(demote_pages, alloc_demote_page, NULL,
+			    target_nid, MIGRATE_ASYNC, MR_DEMOTION,
+			    &nr_succeeded);
+	*/
+	/* TODO_FOR_PROMOTE : not activate page */
+	nr_activate = 0;
 	nr_deactivate = move_pages_to_lru(lruvec, &l_inactive);
 	/* Keep all free folios in l_active list */
 	list_splice(&l_inactive, &l_active);
@@ -2671,6 +2794,15 @@ static unsigned long shrink_list(enum lru_list lru, unsigned long nr_to_scan,
 		return 0;
 	}
 
+	/* TODO_FOR_PROMOTE : promote lru at shrink_list */
+	if (is_promote_lru(lru)) {
+		if (sc->may_deactivate & (1 << is_file_lru(lru)))
+			shrink_promote_list(nr_to_scan, lruvec, sc, lru);
+		else
+			sc->skipped_deactivate = 1;
+		return 0;
+	}
+
 	return shrink_inactive_list(nr_to_scan, lruvec, sc, lru);
 }
 
@@ -2705,12 +2837,16 @@ static unsigned long shrink_list(enum lru_list lru, unsigned long nr_to_scan,
 static bool inactive_is_low(struct lruvec *lruvec, enum lru_list inactive_lru)
 {
 	enum lru_list active_lru = inactive_lru + LRU_ACTIVE;
+	/* TODO_FOR_PROMOTE : promote_lru for check ratio */
+	enum lru_list promote_lru = inactive_lru + LRU_PROMOTE;
 	unsigned long inactive, active;
 	unsigned long inactive_ratio;
 	unsigned long gb;
 
 	inactive = lruvec_page_state(lruvec, NR_LRU_BASE + inactive_lru);
-	active = lruvec_page_state(lruvec, NR_LRU_BASE + active_lru);
+	/* TODO_FOR_PROMOTE : plus the # of pages of promote_lru for check ratio */
+	active = lruvec_page_state(lruvec, NR_LRU_BASE + active_lru) + 
+		lruvec_page_state(lruvec, NR_LRU_BASE + promote_lru);
 
 	gb = (inactive + active) >> (30 - PAGE_SHIFT);
 	if (gb)
@@ -3005,8 +3141,9 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 		 * stop reclaiming one LRU and reduce the amount scanning
 		 * proportional to the original scan target.
 		 */
-		nr_file = nr[LRU_INACTIVE_FILE] + nr[LRU_ACTIVE_FILE];
-		nr_anon = nr[LRU_INACTIVE_ANON] + nr[LRU_ACTIVE_ANON];
+		/* TODO_FOR_PROMOTE : add nr[NRU_PROMOTE] */
+		nr_file = nr[LRU_INACTIVE_FILE] + nr[LRU_ACTIVE_FILE] + nr[LRU_PROMOTE_FILE];
+		nr_anon = nr[LRU_INACTIVE_ANON] + nr[LRU_ACTIVE_ANON] + nr[LRU_PROMOTE_ANON];
 
 		/*
 		 * It's just vindictive to attack the larger once the smaller
@@ -3019,12 +3156,12 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 
 		if (nr_file > nr_anon) {
 			unsigned long scan_target = targets[LRU_INACTIVE_ANON] +
-						targets[LRU_ACTIVE_ANON] + 1;
+						targets[LRU_ACTIVE_ANON] + targets[LRU_PROMOTE_ANON] + 1;
 			lru = LRU_BASE;
 			percentage = nr_anon * 100 / scan_target;
 		} else {
 			unsigned long scan_target = targets[LRU_INACTIVE_FILE] +
-						targets[LRU_ACTIVE_FILE] + 1;
+						targets[LRU_ACTIVE_FILE] + targets[LRU_PROMOTE_FILE] + 1;
 			lru = LRU_FILE;
 			percentage = nr_file * 100 / scan_target;
 		}
@@ -3032,6 +3169,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 		/* Stop scanning the smaller of the LRU */
 		nr[lru] = 0;
 		nr[lru + LRU_ACTIVE] = 0;
+		nr[lru + LRU_PROMOTE] = 0;
 
 		/*
 		 * Recalculate the other LRU scan count based on its original
@@ -4453,6 +4591,12 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 	finish_wait(&pgdat->kswapd_wait, &wait);
 }
 
+/* TODO_FOR_PROMOTE : sleep kpromoted */
+static void kpromoted_try_to_sleep(void)
+{
+		schedule_timeout(HZ);
+}
+
 /*
  * The background pageout daemon, started as a kernel thread
  * from the init process.
@@ -4541,6 +4685,49 @@ kswapd_try_sleep:
 	}
 
 	tsk->flags &= ~(PF_MEMALLOC | PF_KSWAPD);
+
+	return 0;
+}
+/* TODO_FOR_PROMOTE : kpromoted thread */
+static int kpromoted(void *p)
+{
+	pg_data_t *pgdat = (pg_data_t *)p;
+
+	struct scan_control sc = {
+		.nr_to_reclaim = SWAP_CLUSTER_MAX,
+		.gfp_mask = (current_gfp_context(GFP_KERNEL) & GFP_RECLAIM_MASK) |
+				(GFP_HIGHUSER_MOVABLE & ~GFP_RECLAIM_MASK),
+		.reclaim_idx = MAX_NR_ZONES - 1,
+		.priority = DEF_PRIORITY,
+		.may_writepage = !laptop_mode,
+		.may_unmap = 1,
+		.no_shrink = 1,
+	};
+	enum lru_list lru;
+	unsigned long nr_to_scan;
+	struct mem_cgroup *memcg;
+	struct mem_cgroup_per_node *mz;
+	struct lruvec *lruvec;
+	
+	memcg = root_mem_cgroup;
+	mz = memcg->nodeinfo[pgdat->node_id];
+	lruvec = &mz->lruvec;
+
+
+	for(;;){
+		kpromoted_try_to_sleep();
+
+		if(kthread_should_stop())
+			break;
+		
+		for_each_evictable_lru(lru) {
+			if (is_promote_lru(lru)) {
+				nr_to_scan = 1024;
+
+				shrink_promote_list(nr_to_scan, lruvec, &sc, lru);
+			}
+		}
+	}
 
 	return 0;
 }
@@ -4655,6 +4842,27 @@ void kswapd_run(int nid)
 	}
 }
 
+/*TODO_FOR_PROMOTE : check kpromoted and if starting is posible then kthread_run */
+void kpromoted_run(int nid)
+{
+	pg_data_t *pgdat = NODE_DATA(nid);
+
+	pr_info("kpromoted_run 1\n");
+	
+	// TODO_FOR_PROMOTE : check kpromoted flag
+	if (pgdat->kpromoted || nid != 1)
+		return;
+
+	pr_info("kpromoted_run 2\n");
+	// TODO_FOR_PROMOTE : run kpromoted thread
+	pgdat->kpromoted = kthread_run(kpromoted, pgdat, "kpromoted%d", nid);
+	if (IS_ERR(pgdat->kpromoted)) {
+		BUG_ON(system_state < SYSTEM_RUNNING);
+		pr_err("Failed to start kprmoted on node %d\n", nid);
+		pgdat->kpromoted = NULL;
+	}
+}
+
 /*
  * Called by memory hotplug when all memory in a node is offlined.  Caller must
  * be holding mem_hotplug_begin/done().
@@ -4669,13 +4877,28 @@ void kswapd_stop(int nid)
 	}
 }
 
+/* TODO_FOR_PROMOTE : stop kpromted */
+void kpromoted_stop(int nid)
+{
+	struct task_struct *kpromoted = NODE_DATA(nid)->kpromoted;
+
+	if (kpromoted) {
+		kthread_stop(kpromoted);
+		NODE_DATA(nid)->kpromoted = NULL;
+	}
+}
+
 static int __init kswapd_init(void)
 {
 	int nid;
+	pr_info("kswapd_init\n");
 
 	swap_setup();
-	for_each_node_state(nid, N_MEMORY)
+	for_each_node_state(nid, N_MEMORY) {
  		kswapd_run(nid);
+		kpromoted_run(nid);
+	}
+	/* TOD_FOR_PROMOTE : run kpromted for node 1 */
 	return 0;
 }
 
@@ -4811,10 +5034,10 @@ int node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned int order)
 
 	/*
 	 * Node reclaim reclaims unmapped file backed pages and
-	 * slab pages if we are over the defined limits.
+	 * slab pages is we are over the defined limites.
 	 *
-	 * A small portion of unmapped file backed pages is needed for
-	 * file I/O otherwise pages read by file I/O will be immediately
+	 * A small protion of unmapped filed backed pages is needed for
+	 * file I/O otherwise pages read by fiel I/O will be immediately
 	 * thrown out if the node is overallocated. So we do not reclaim
 	 * if less than a specified percentage of the node is used by
 	 * unmapped file backed pages.

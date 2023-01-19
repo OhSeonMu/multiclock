@@ -446,6 +446,8 @@ void check_move_unevictable_pages(struct pagevec *pvec);
 
 extern void kswapd_run(int nid);
 extern void kswapd_stop(int nid);
+extern void kpromoted_run(int nid);
+extern void kpromoted_stop(int nid); /* TODO_FOR_PROMOTE : kpromoted stop */
 
 #ifdef CONFIG_SWAP
 
